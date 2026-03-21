@@ -1,17 +1,6 @@
 /**
- * XAMTON MessagePipeline
- * Управление соединением с relay-сервером и отправкой сообщений
- *
- * WS протокол сервера:
- *   → connect /ws/{user_id}
- *   ← {type: "auth_challenge", challenge: "<b64>"}
- *   → {type: "auth_response", signature: ""}   (legacy — без подписи)
- *   ← {type: "auth_success"}
- *   ← {type: "pending_message", message: {...}}
- *   ← {type: "new_message", message: {id, sender_id, payload, timestamp}}
- *   → {type: "message", recipient_id, payload, message_id}
- *   ← {type: "message_ack", message_id, delivered}
- *   → {type: "ping"}   ← {type: "pong"}
+ * XAMTON MessagePipeline v2
+ * Исправлено: auth без ожидания challenge, дедупликация сообщений, логи
  */
 import { Identity, Message, TransportType } from '../crypto/types';
 import { useTransportStore } from '../../store/useTransportStore';
@@ -29,6 +18,7 @@ class MessagePipeline {
   private reconnectDelay = 2000;
   private isDestroyed = false;
   private pendingAcks: Map<string, (delivered: boolean) => void> = new Map();
+  private deliveredIds: Set<string> = new Set();
 
   async initialize(identity: Identity, displayName?: string) {
     this.identity = identity;
@@ -59,20 +49,32 @@ class MessagePipeline {
     });
 
     if (!res.ok) throw new Error(`Register failed: ${res.status}`);
-    return res.json();
+    const data = await res.json();
+    console.log('[Pipeline] Registered:', data);
+    return data;
   }
 
   private connect() {
     if (!this.identity || this.isDestroyed) return;
 
+    console.log('[Pipeline] Connecting to', `${WS_URL}/api/ws/${this.identity.userId.slice(0, 8)}...`);
+
     try {
       this.ws = new WebSocket(`${WS_URL}/api/ws/${this.identity.userId}`);
 
       this.ws.onopen = () => {
-        console.log('[Pipeline] WS connected');
+        console.log('[Pipeline] WS open — sending auth_response immediately');
         this.reconnectDelay = 2000;
 
-        // Ping каждые 25с чтобы не таймаутнуло
+        // Сервер может пропустить auth_challenge для legacy пользователей
+        // Отправляем пустой auth_response сразу после открытия
+        this.ws?.send(JSON.stringify({ type: 'auth_response', signature: '' }));
+
+        // Считаем себя подключёнными и забираем офлайн сообщения
+        useTransportStore.getState().setTransportConnected('internet', true);
+        this.fetchOfflineMessages();
+
+        // Ping каждые 25с
         this.pingTimer = setInterval(() => {
           if (this.ws?.readyState === WebSocket.OPEN) {
             this.ws.send(JSON.stringify({ type: 'ping' }));
@@ -83,20 +85,21 @@ class MessagePipeline {
       this.ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          console.log('[Pipeline] ←', data.type);
           this.handleServerMessage(data);
         } catch (err) {
           console.warn('[Pipeline] Parse error:', err);
         }
       };
 
-      this.ws.onclose = () => {
-        console.log('[Pipeline] WS disconnected');
+      this.ws.onclose = (e) => {
+        console.log('[Pipeline] WS closed', e.code, e.reason);
         clearInterval(this.pingTimer);
         useTransportStore.getState().setTransportConnected('internet', false);
         this.scheduleReconnect();
       };
 
-      this.ws.onerror = (err) => {
+      this.ws.onerror = () => {
         console.warn('[Pipeline] WS error');
       };
     } catch (err) {
@@ -108,14 +111,13 @@ class MessagePipeline {
   private handleServerMessage(data: any) {
     switch (data.type) {
       case 'auth_challenge':
-        // Legacy mode: сервер принимает пустую подпись
+        // Дополнительно отвечаем если пришёл challenge
         this.ws?.send(JSON.stringify({ type: 'auth_response', signature: '' }));
         break;
 
       case 'auth_success':
         useTransportStore.getState().setTransportConnected('internet', true);
-        console.log('[Pipeline] Auth OK');
-        this.fetchOfflineMessages();
+        console.log('[Pipeline] Auth success confirmed by server');
         break;
 
       case 'auth_failed':
@@ -148,6 +150,7 @@ class MessagePipeline {
         break;
 
       default:
+        console.log('[Pipeline] Unknown message type:', data.type);
         break;
     }
   }
@@ -164,9 +167,14 @@ class MessagePipeline {
   private async fetchOfflineMessages() {
     if (!this.identity) return;
     try {
+      console.log('[Pipeline] Fetching offline messages...');
       const res = await fetch(`${RELAY_URL}/api/messages/${this.identity.userId}`);
-      if (!res.ok) return;
+      if (!res.ok) {
+        console.warn('[Pipeline] Offline fetch failed:', res.status);
+        return;
+      }
       const data = await res.json();
+      console.log('[Pipeline] Offline messages:', data.count || 0);
       for (const msg of data.messages || []) {
         await this.deliverIncomingMessage(msg);
       }
@@ -181,7 +189,14 @@ class MessagePipeline {
     const senderId: string = raw.sender_id;
     if (!senderId || senderId === this.identity.userId) return;
 
-    // Lazy import чтобы избежать circular deps
+    // Дедупликация
+    const msgId = raw.id || '';
+    if (msgId && this.deliveredIds.has(msgId)) {
+      console.log('[Pipeline] Duplicate message skipped:', msgId);
+      return;
+    }
+    if (msgId) this.deliveredIds.add(msgId);
+
     const { useChatStore } = require('../../store/useChatStore');
     const { useContactStore } = require('../../store/useContactStore');
 
@@ -207,8 +222,10 @@ class MessagePipeline {
       textContent = String(raw.payload ?? '[зашифровано]');
     }
 
+    console.log('[Pipeline] Delivering message from', senderId.slice(0, 8), ':', textContent.slice(0, 30));
+
     const message: Message = {
-      id: raw.id || uuidv4(),
+      id: msgId || uuidv4(),
       chatId: chat.id,
       senderId,
       type: 'text',
@@ -228,7 +245,6 @@ class MessagePipeline {
     const { useChatStore } = require('../../store/useChatStore');
     const chatStore = useChatStore.getState();
 
-    // Добавляем локально
     const localMessage: Message = {
       id: messageId,
       chatId,
@@ -245,6 +261,7 @@ class MessagePipeline {
 
     // Отправляем через WS
     if (this.ws?.readyState === WebSocket.OPEN) {
+      console.log('[Pipeline] → message via WS to', recipientId.slice(0, 8));
       this.ws.send(
         JSON.stringify({
           type: 'message',
@@ -254,7 +271,6 @@ class MessagePipeline {
         })
       );
 
-      // Ждём ack до 5 сек
       const delivered = await new Promise<boolean>((resolve) => {
         this.pendingAcks.set(messageId, resolve);
         setTimeout(() => {
@@ -270,6 +286,7 @@ class MessagePipeline {
     }
 
     // Fallback: HTTP store-and-forward
+    console.log('[Pipeline] WS not open, using HTTP fallback');
     try {
       const res = await fetch(`${RELAY_URL}/api/messages`, {
         method: 'POST',
@@ -281,7 +298,8 @@ class MessagePipeline {
         }),
       });
       this.setMessageStatus(chatId, messageId, res.ok ? 'sent' : 'failed');
-    } catch {
+    } catch (err) {
+      console.warn('[Pipeline] HTTP fallback failed:', err);
       this.setMessageStatus(chatId, messageId, 'failed');
       throw new Error('Нет подключения к серверу');
     }
