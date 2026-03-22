@@ -1,12 +1,12 @@
 /**
- * XAMTON MessagePipeline v2
- * Исправлено: auth без ожидания challenge, дедупликация сообщений, логи
+ * XAMTON MessagePipeline v3
+ * Мультитранспортная система: WebSocket → BLE → WiFi Direct → DNS → HTTP
  */
 import { Identity, Message, TransportType } from '../crypto/types';
 import { useTransportStore } from '../../store/useTransportStore';
 import { v4 as uuidv4 } from 'uuid';
 
-const RELAY_URL = process.env.EXPO_PUBLIC_RELAY_URL || 'https://e2e2-backend.onrender.com';
+const RELAY_URL = process.env.EXPO_PUBLIC_RELAY_URL || 'https://xamton-relay.onrender.com';
 const WS_URL = RELAY_URL.replace('https://', 'wss://').replace('http://', 'ws://');
 
 class MessagePipeline {
@@ -20,24 +20,25 @@ class MessagePipeline {
   private pendingAcks: Map<string, (delivered: boolean) => void> = new Map();
   private deliveredIds: Set<string> = new Set();
 
+  // ─── Инициализация ───────────────────────────────────────────────────────
+
   async initialize(identity: Identity, displayName?: string) {
     this.identity = identity;
     this.displayName = displayName;
     this.isDestroyed = false;
 
-    try {
-      await this.registerUser();
-    } catch (err) {
+    try { await this.registerUser(); } catch (err) {
       console.warn('[Pipeline] Register error:', err);
     }
 
     this.connect();
+    // Запускаем все транспорты параллельно
+    this.initializeTransports().catch(console.warn);
   }
 
   private async registerUser() {
     if (!this.identity) return;
     const { encodeBase64 } = require('tweetnacl-util');
-
     const res = await fetch(`${RELAY_URL}/api/users/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -47,34 +48,26 @@ class MessagePipeline {
         identity_key: encodeBase64(this.identity.identityKeyPair.publicKey),
       }),
     });
-
     if (!res.ok) throw new Error(`Register failed: ${res.status}`);
-    const data = await res.json();
-    console.log('[Pipeline] Registered:', data);
-    return data;
+    return res.json();
   }
+
+  // ─── WebSocket ────────────────────────────────────────────────────────────
 
   private connect() {
     if (!this.identity || this.isDestroyed) return;
-
-    console.log('[Pipeline] Connecting to', `${WS_URL}/api/ws/${this.identity.userId.slice(0, 8)}...`);
 
     try {
       this.ws = new WebSocket(`${WS_URL}/api/ws/${this.identity.userId}`);
 
       this.ws.onopen = () => {
-        console.log('[Pipeline] WS open — sending auth_response immediately');
+        console.log('[Pipeline] WS connected');
         this.reconnectDelay = 2000;
-
-        // Сервер может пропустить auth_challenge для legacy пользователей
-        // Отправляем пустой auth_response сразу после открытия
+        // Legacy auth — сервер примет пустую подпись
         this.ws?.send(JSON.stringify({ type: 'auth_response', signature: '' }));
-
-        // Считаем себя подключёнными и забираем офлайн сообщения
         useTransportStore.getState().setTransportConnected('internet', true);
         this.fetchOfflineMessages();
 
-        // Ping каждые 25с
         this.pingTimer = setInterval(() => {
           if (this.ws?.readyState === WebSocket.OPEN) {
             this.ws.send(JSON.stringify({ type: 'ping' }));
@@ -85,23 +78,20 @@ class MessagePipeline {
       this.ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          console.log('[Pipeline] ←', data.type);
           this.handleServerMessage(data);
         } catch (err) {
           console.warn('[Pipeline] Parse error:', err);
         }
       };
 
-      this.ws.onclose = (e) => {
-        console.log('[Pipeline] WS closed', e.code, e.reason);
+      this.ws.onclose = () => {
+        console.log('[Pipeline] WS disconnected');
         clearInterval(this.pingTimer);
         useTransportStore.getState().setTransportConnected('internet', false);
         this.scheduleReconnect();
       };
 
-      this.ws.onerror = () => {
-        console.warn('[Pipeline] WS error');
-      };
+      this.ws.onerror = () => console.warn('[Pipeline] WS error');
     } catch (err) {
       console.warn('[Pipeline] Connect error:', err);
       this.scheduleReconnect();
@@ -111,46 +101,25 @@ class MessagePipeline {
   private handleServerMessage(data: any) {
     switch (data.type) {
       case 'auth_challenge':
-        // Дополнительно отвечаем если пришёл challenge
         this.ws?.send(JSON.stringify({ type: 'auth_response', signature: '' }));
         break;
-
       case 'auth_success':
         useTransportStore.getState().setTransportConnected('internet', true);
-        console.log('[Pipeline] Auth success confirmed by server');
         break;
-
       case 'auth_failed':
-        console.error('[Pipeline] Auth failed');
         this.ws?.close();
         break;
-
       case 'pending_message':
       case 'new_message':
-        if (data.message) {
-          this.deliverIncomingMessage(data.message);
-        }
+        if (data.message) this.deliverIncomingMessage(data.message);
         break;
-
       case 'message_ack': {
         const resolve = this.pendingAcks.get(data.message_id);
-        if (resolve) {
-          resolve(!!data.delivered);
-          this.pendingAcks.delete(data.message_id);
-        }
+        if (resolve) { resolve(!!data.delivered); this.pendingAcks.delete(data.message_id); }
         break;
       }
-
       case 'peer_connected':
         useTransportStore.getState().setTotalPeers(data.online_users || 0);
-        break;
-
-      case 'pong':
-      case 'typing':
-        break;
-
-      default:
-        console.log('[Pipeline] Unknown message type:', data.type);
         break;
     }
   }
@@ -167,12 +136,8 @@ class MessagePipeline {
   private async fetchOfflineMessages() {
     if (!this.identity) return;
     try {
-      console.log('[Pipeline] Fetching offline messages...');
       const res = await fetch(`${RELAY_URL}/api/messages/${this.identity.userId}`);
-      if (!res.ok) {
-        console.warn('[Pipeline] Offline fetch failed:', res.status);
-        return;
-      }
+      if (!res.ok) return;
       const data = await res.json();
       console.log('[Pipeline] Offline messages:', data.count || 0);
       for (const msg of data.messages || []) {
@@ -183,7 +148,9 @@ class MessagePipeline {
     }
   }
 
-  private async deliverIncomingMessage(raw: any) {
+  // ─── Доставка входящих сообщений (общая для всех транспортов) ────────────
+
+  async deliverIncomingMessage(raw: any) {
     if (!this.identity) return;
 
     const senderId: string = raw.sender_id;
@@ -191,38 +158,29 @@ class MessagePipeline {
 
     // Дедупликация
     const msgId = raw.id || '';
-    if (msgId && this.deliveredIds.has(msgId)) {
-      console.log('[Pipeline] Duplicate message skipped:', msgId);
-      return;
-    }
+    if (msgId && this.deliveredIds.has(msgId)) return;
     if (msgId) this.deliveredIds.add(msgId);
 
     const { useChatStore } = require('../../store/useChatStore');
     const { useContactStore } = require('../../store/useContactStore');
-
     const chatStore = useChatStore.getState();
     const contactStore = useContactStore.getState();
 
     let chat = chatStore.getChatByParticipant(senderId);
     if (!chat) {
       const contact = contactStore.getContact(senderId);
-      chat = await chatStore.createChat(
-        [this.identity.userId, senderId],
-        contact?.name
-      );
+      chat = await chatStore.createChat([this.identity.userId, senderId], contact?.name);
     }
 
-    // Парсим payload
     let textContent = '';
     try {
-      const payload =
-        typeof raw.payload === 'string' ? JSON.parse(raw.payload) : raw.payload;
+      const payload = typeof raw.payload === 'string' ? JSON.parse(raw.payload) : raw.payload;
       textContent = typeof payload === 'object' ? (payload?.text ?? '') : String(payload ?? '');
     } catch {
       textContent = String(raw.payload ?? '[зашифровано]');
     }
 
-    console.log('[Pipeline] Delivering message from', senderId.slice(0, 8), ':', textContent.slice(0, 30));
+    const transport: TransportType = raw.transport || 'internet';
 
     const message: Message = {
       id: msgId || uuidv4(),
@@ -232,11 +190,13 @@ class MessagePipeline {
       content: { type: 'text', text: textContent },
       timestamp: raw.timestamp ? new Date(raw.timestamp).getTime() : Date.now(),
       status: 'delivered',
-      transportUsed: 'internet' as TransportType,
+      transportUsed: transport,
     };
 
     await chatStore.addMessage(chat.id, message);
   }
+
+  // ─── Отправка сообщений (каскадный выбор транспорта) ─────────────────────
 
   async sendTextMessage(chatId: string, recipientId: string, text: string): Promise<void> {
     if (!this.identity) throw new Error('Not initialized');
@@ -244,6 +204,7 @@ class MessagePipeline {
     const messageId = uuidv4();
     const { useChatStore } = require('../../store/useChatStore');
     const chatStore = useChatStore.getState();
+    const bestTransport = this.getBestTransport(recipientId);
 
     const localMessage: Message = {
       id: messageId,
@@ -253,23 +214,20 @@ class MessagePipeline {
       content: { type: 'text', text },
       timestamp: Date.now(),
       status: 'sending',
-      transportUsed: 'internet' as TransportType,
+      transportUsed: bestTransport,
     };
     await chatStore.addMessage(chatId, localMessage);
 
     const payload = JSON.stringify({ text });
 
-    // Отправляем через WS
+    // 1. WebSocket (интернет)
     if (this.ws?.readyState === WebSocket.OPEN) {
-      console.log('[Pipeline] → message via WS to', recipientId.slice(0, 8));
-      this.ws.send(
-        JSON.stringify({
-          type: 'message',
-          recipient_id: recipientId,
-          payload,
-          message_id: messageId,
-        })
-      );
+      this.ws.send(JSON.stringify({
+        type: 'message',
+        recipient_id: recipientId,
+        payload,
+        message_id: messageId,
+      }));
 
       const delivered = await new Promise<boolean>((resolve) => {
         this.pendingAcks.set(messageId, resolve);
@@ -285,8 +243,53 @@ class MessagePipeline {
       return;
     }
 
-    // Fallback: HTTP store-and-forward
-    console.log('[Pipeline] WS not open, using HTTP fallback');
+    // 2. BLE Mesh
+    try {
+      const { bleTransport } = require('./BLETransport');
+      if (bleTransport.isReady()) {
+        const sent = await bleTransport.sendMessage({
+          id: messageId,
+          senderId: this.identity.userId,
+          recipientId,
+          payload,
+          timestamp: Date.now(),
+          ttl: 3,
+        });
+        if (sent) {
+          console.log('[Pipeline] → BLE');
+          this.setMessageStatus(chatId, messageId, 'sent');
+          return;
+        }
+      }
+    } catch {}
+
+    // 3. WiFi Direct
+    try {
+      const { wifiDirectTransport } = require('./WiFiDirectTransport');
+      if (wifiDirectTransport.isReady()) {
+        const sent = await wifiDirectTransport.sendMessage(recipientId, payload);
+        if (sent) {
+          console.log('[Pipeline] → WiFi Direct');
+          this.setMessageStatus(chatId, messageId, 'sent');
+          return;
+        }
+      }
+    } catch {}
+
+    // 4. DNS Tunnel
+    try {
+      const { dnsTunnel } = require('./DNSTunnel');
+      if (dnsTunnel.isReady()) {
+        const sent = await dnsTunnel.sendMessage(recipientId, payload);
+        if (sent) {
+          console.log('[Pipeline] → DNS Tunnel');
+          this.setMessageStatus(chatId, messageId, 'sent');
+          return;
+        }
+      }
+    } catch {}
+
+    // 5. HTTP store-and-forward (последний шанс)
     try {
       const res = await fetch(`${RELAY_URL}/api/messages`, {
         method: 'POST',
@@ -298,12 +301,101 @@ class MessagePipeline {
         }),
       });
       this.setMessageStatus(chatId, messageId, res.ok ? 'sent' : 'failed');
-    } catch (err) {
-      console.warn('[Pipeline] HTTP fallback failed:', err);
+      if (!res.ok) throw new Error('HTTP failed');
+    } catch {
       this.setMessageStatus(chatId, messageId, 'failed');
-      throw new Error('Нет подключения к серверу');
+      throw new Error('Нет подключения. Сообщение будет отправлено когда появится связь.');
     }
   }
+
+  private getBestTransport(recipientId: string): TransportType {
+    if (this.ws?.readyState === WebSocket.OPEN) return 'internet';
+    try {
+      const { bleTransport } = require('./BLETransport');
+      if (bleTransport.isReady() && bleTransport.getPeers().some((p: any) => p.userId === recipientId))
+        return 'mesh_ble';
+    } catch {}
+    try {
+      const { wifiDirectTransport } = require('./WiFiDirectTransport');
+      if (wifiDirectTransport.isReady() && wifiDirectTransport.getPeers().some((p: any) => p.userId === recipientId))
+        return 'mesh_wifi';
+    } catch {}
+    try {
+      const { dnsTunnel } = require('./DNSTunnel');
+      if (dnsTunnel.isReady()) return 'dns';
+    } catch {}
+    return 'offline';
+  }
+
+  // ─── Инициализация всех транспортов ──────────────────────────────────────
+
+  async initializeTransports(): Promise<void> {
+    if (!this.identity) return;
+    const userId = this.identity.userId;
+    const name = this.displayName || userId.slice(0, 12);
+    const transportStore = useTransportStore.getState();
+
+    // BLE
+    if (transportStore.transports.mesh_ble.enabled) {
+      try {
+        const { bleTransport } = require('./BLETransport');
+        const ok = await bleTransport.initialize(userId, name);
+        if (ok) {
+          await bleTransport.startScanning();
+          bleTransport.onMessage((msg: any) => {
+            this.deliverIncomingMessage({
+              id: msg.id,
+              sender_id: msg.senderId,
+              payload: msg.payload,
+              timestamp: new Date(msg.timestamp).toISOString(),
+              transport: 'mesh_ble',
+            });
+          });
+          console.log('[Pipeline] BLE ready');
+        }
+      } catch (err) { console.warn('[Pipeline] BLE init failed:', err); }
+    }
+
+    // WiFi Direct
+    if (transportStore.transports.mesh_wifi.enabled) {
+      try {
+        const { wifiDirectTransport } = require('./WiFiDirectTransport');
+        const ok = await wifiDirectTransport.initialize(userId, name);
+        if (ok) {
+          wifiDirectTransport.onMessage((senderId: string, payload: string) => {
+            this.deliverIncomingMessage({
+              sender_id: senderId,
+              payload,
+              timestamp: new Date().toISOString(),
+              transport: 'mesh_wifi',
+            });
+          });
+          console.log('[Pipeline] WiFi Direct ready');
+        }
+      } catch (err) { console.warn('[Pipeline] WiFi Direct init failed:', err); }
+    }
+
+    // DNS Tunnel
+    if (transportStore.transports.dns.enabled) {
+      try {
+        const { dnsTunnel } = require('./DNSTunnel');
+        const ok = await dnsTunnel.initialize(userId);
+        if (ok) {
+          dnsTunnel.onMessage((senderId: string, payload: string) => {
+            this.deliverIncomingMessage({
+              sender_id: senderId,
+              payload,
+              timestamp: new Date().toISOString(),
+              transport: 'dns',
+            });
+          });
+          console.log('[Pipeline] DNS Tunnel ready');
+        }
+      } catch (err) { console.warn('[Pipeline] DNS init failed:', err); }
+    }
+  }
+
+  // ─── Утилиты ──────────────────────────────────────────────────────────────
 
   private setMessageStatus(chatId: string, messageId: string, status: Message['status']) {
     const { useChatStore } = require('../../store/useChatStore');
@@ -324,6 +416,10 @@ class MessagePipeline {
     this.ws?.close();
     this.ws = null;
     this.pendingAcks.clear();
+
+    try { require('./BLETransport').bleTransport.destroy(); } catch {}
+    try { require('./WiFiDirectTransport').wifiDirectTransport.destroy(); } catch {}
+    try { require('./DNSTunnel').dnsTunnel.destroy(); } catch {}
   }
 }
 

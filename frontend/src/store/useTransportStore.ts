@@ -17,12 +17,13 @@ interface TransportStore {
   setTotalPeers: (count: number) => void;
 }
 
+// Все транспорты включены по умолчанию — пусть система сама решает что доступно
 const defaultTransports: TransportMap = {
   internet: { enabled: true, connected: false, peerCount: 0 },
-  dns: { enabled: false, connected: false, peerCount: 0 },
-  mesh_ble: { enabled: false, connected: false, peerCount: 0 },
-  mesh_wifi: { enabled: false, connected: false, peerCount: 0 },
-  offline: { enabled: true, connected: true, peerCount: 0 },
+  dns:      { enabled: true, connected: false, peerCount: 0 },
+  mesh_ble: { enabled: true, connected: false, peerCount: 0 },
+  mesh_wifi:{ enabled: true, connected: false, peerCount: 0 },
+  offline:  { enabled: true, connected: true,  peerCount: 0 },
 };
 
 export const useTransportStore = create<TransportStore>((set, get) => ({
