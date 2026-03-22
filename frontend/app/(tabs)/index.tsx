@@ -3,7 +3,7 @@
  * Главный экран со списком чатов
  */
 
-import React, { useCallback } from 'react';
+import React, { useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -11,6 +11,8 @@ import {
   StyleSheet,
   TouchableOpacity,
   SafeAreaView,
+  Alert,
+  Linking,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -24,6 +26,8 @@ import { colors } from '../../src/theme/colors';
 import { typography } from '../../src/theme/typography';
 import { spacing } from '../../src/theme/spacing';
 import { Chat } from '../../src/core/crypto/types';
+import { requestAllPermissions } from '../../src/core/network/Permissions';
+import { messagePipeline } from '../../src/core/network/MessagePipeline';
 
 export default function ChatListScreen() {
   const router = useRouter();
@@ -31,35 +35,50 @@ export default function ChatListScreen() {
   const { contacts } = useContactStore();
   const { displayName, identity } = useIdentityStore();
 
+  // Запрашиваем разрешения при первом открытии главного экрана
+  useEffect(() => {
+    async function requestPerms() {
+      const result = await requestAllPermissions();
+      console.log('[Index] Permissions:', result);
+
+      if (!result.bluetooth) {
+        Alert.alert(
+          'Bluetooth недоступен',
+          'Для работы mesh-сети без интернета нужен Bluetooth. Разрешить?',
+          [
+            { text: 'Потом', style: 'cancel' },
+            { text: 'Настройки', onPress: () => Linking.openSettings() },
+          ]
+        );
+      }
+
+      // Перезапускаем транспорты после получения разрешений
+      if (identity && (result.bluetooth || result.location)) {
+        messagePipeline.initializeTransports().catch(console.warn);
+      }
+    }
+
+    requestPerms();
+  }, [identity]);
+
   const getContactName = useCallback((chat: Chat) => {
     if (chat.type === 'group') return chat.name || 'Группа';
-    
     const participantId = chat.participantIds.find(id => id !== identity?.userId);
     if (!participantId) return 'Неизвестный';
-    
     const contact = contacts.find(c => c.userId === participantId);
     return contact?.name || participantId.slice(0, 12) + '...';
   }, [contacts, identity?.userId]);
 
-  const handleChatPress = (chat: Chat) => {
-    router.push(`/chat/${chat.id}`);
-  };
-
-  const handleNewChat = () => {
-    router.push('/newchat');
-  };
-
-  const handleNetworkPress = () => {
-    router.push('/network');
-  };
+  const handleChatPress = (chat: Chat) => router.push(`/chat/${chat.id}`);
+  const handleNewChat = () => router.push('/newchat');
+  const handleNetworkPress = () => router.push('/network');
 
   const renderEmptyState = () => (
     <View style={styles.emptyContainer}>
       <Ionicons name="chatbubbles-outline" size={64} color={colors.light.textTertiary} />
       <Text style={styles.emptyTitle}>Нет чатов</Text>
       <Text style={styles.emptyText}>
-        Нажмите кнопку ниже, чтобы{"\n"}
-        начать новый чат
+        Нажмите кнопку ниже, чтобы{"\n"}начать новый чат
       </Text>
     </View>
   );
@@ -71,9 +90,7 @@ export default function ChatListScreen() {
         <TouchableOpacity style={styles.menuButton}>
           <Ionicons name="menu" size={26} color={colors.light.textPrimary} />
         </TouchableOpacity>
-        
         <Text style={styles.headerTitle}>XAMTON</Text>
-        
         <View style={styles.headerRight}>
           <TouchableOpacity style={styles.headerButton}>
             <Ionicons name="search" size={24} color={colors.light.textPrimary} />
