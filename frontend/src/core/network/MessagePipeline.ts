@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 const RELAY_URL = process.env.EXPO_PUBLIC_RELAY_URL || 'https://xamton-relay.onrender.com';
 const WS_URL = RELAY_URL.replace('https://', 'wss://').replace('http://', 'ws://');
 
+
 class MessagePipeline {
   private ws: WebSocket | null = null;
   private identity: Identity | null = null;
@@ -340,7 +341,10 @@ class MessagePipeline {
       try {
         const { bleTransport } = require('./BLETransport');
         const ok = await bleTransport.initialize(userId, name);
+        const { startBLEAdvertising } = require('./BLEAdvertiser');
+
         if (ok) {
+          await startBLEAdvertising(userId, name);
           await bleTransport.startScanning();
           bleTransport.onMessage((msg: any) => {
             this.deliverIncomingMessage({
