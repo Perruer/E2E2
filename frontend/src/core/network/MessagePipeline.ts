@@ -1,6 +1,10 @@
 /**
- * XAMTON MessagePipeline v3
- * Мультитранспортная система: WebSocket → BLE → WiFi Direct → DNS → HTTP
+ * XAMTON MessagePipeline v4
+ * Мультитранспортная система: WebSocket → BLE Mesh → WiFi Direct → DNS → HTTP
+ * 
+ * Изменения v4:
+ * - BLE: используем новый нативный модуль (убрали react-native-ble-plx и ble-advertiser)
+ * - BLEAdvertiser.ts больше не нужен — advertising встроен в BLETransport
  */
 import { Identity, Message, TransportType } from '../crypto/types';
 import { useTransportStore } from '../../store/useTransportStore';
@@ -257,7 +261,7 @@ class MessagePipeline {
           ttl: 3,
         });
         if (sent) {
-          console.log('[Pipeline] → BLE');
+          console.log('[Pipeline] → BLE Mesh');
           this.setMessageStatus(chatId, messageId, 'sent');
           return;
         }
@@ -313,7 +317,7 @@ class MessagePipeline {
     if (this.ws?.readyState === WebSocket.OPEN) return 'internet';
     try {
       const { bleTransport } = require('./BLETransport');
-      if (bleTransport.isReady() && bleTransport.getPeers().some((p: any) => p.userId === recipientId))
+      if (bleTransport.isReady() && bleTransport.hasPeer(recipientId))
         return 'mesh_ble';
     } catch {}
     try {
@@ -336,16 +340,13 @@ class MessagePipeline {
     const name = this.displayName || userId.slice(0, 12);
     const transportStore = useTransportStore.getState();
 
-    // BLE
+    // BLE Mesh (новый нативный модуль — advertising + scanning + GATT в одном)
     if (transportStore.transports.mesh_ble.enabled) {
       try {
         const { bleTransport } = require('./BLETransport');
         const ok = await bleTransport.initialize(userId, name);
-        const { startBLEAdvertising } = require('./BLEAdvertiser');
 
         if (ok) {
-          await startBLEAdvertising(userId, name);
-          await bleTransport.startScanning();
           bleTransport.onMessage((msg: any) => {
             this.deliverIncomingMessage({
               id: msg.id,
@@ -355,7 +356,7 @@ class MessagePipeline {
               transport: 'mesh_ble',
             });
           });
-          console.log('[Pipeline] BLE ready');
+          console.log('[Pipeline] BLE Mesh ready');
         }
       } catch (err) { console.warn('[Pipeline] BLE init failed:', err); }
     }

@@ -88,6 +88,16 @@ android {
     compileSdk rootProject.ext.compileSdkVersion
 
     namespace 'com.xamton.messenger'
+
+    // Java 17 — нужно для react-native-ble-advertiser (0.0.17) и RN 0.81+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
     defaultConfig {
         applicationId 'com.xamton.messenger'
         minSdkVersion rootProject.ext.minSdkVersion

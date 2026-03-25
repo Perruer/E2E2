@@ -1,23 +1,31 @@
 /**
- * XAMTON BLE Mesh Transport v2
- * Исправлено: защита от повторного сканирования, правильный advertising
+ * XAMTON BLE Mesh Transport v3
+ * Нативный модуль — без react-native-ble-plx и react-native-ble-advertiser
+ * 
+ * Архитектура:
+ * - Каждое устройство одновременно Peripheral (GATT Server + Advertising)
+ *   и Central (Scanner + GATT Client)
+ * - При обнаружении другого XAMTON устройства — автоматическое подключение
+ * - Handshake для обмена userId
+ * - Mesh relay: сообщения с TTL > 0 пересылаются через промежуточные устройства
  */
 
-import { Platform, PermissionsAndroid } from 'react-native';
+import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
 import { useTransportStore } from '../../store/useTransportStore';
 import { v4 as uuidv4 } from 'uuid';
 
-const XAMTON_SERVICE_UUID = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
-const XAMTON_TX_CHAR_UUID = '6E400002-B5A3-F393-E0A9-E50E24DCCA9E';
-const XAMTON_RX_CHAR_UUID = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
-const SCAN_INTERVAL_MS = 30000; // пересканируем каждые 30 сек
-const BLE_CHUNK_SIZE = 182;
+const { XAMTONBle } = NativeModules;
+const bleEmitter = Platform.OS === 'android' && XAMTONBle
+  ? new NativeEventEmitter(XAMTONBle)
+  : null;
+
+// ─── Типы ────────────────────────────────────────────────────────────────
 
 export interface BLEPeer {
-  id: string;
+  mac: string;
   userId: string;
-  name: string;
-  rssi: number;
+  role: 'central' | 'peripheral';
+  rssi?: number;
   lastSeen: number;
 }
 
@@ -33,45 +41,47 @@ export interface BLEMessage {
 
 type MessageHandler = (message: BLEMessage) => void;
 
-class BLETransport {
-  private manager: any = null;
-  private isScanning = false;
-  private scanScheduled = false; // защита от двойного планирования
-  private peers: Map<string, BLEPeer> = new Map();
-  private connectedDevices: Map<string, any> = new Map();
-  private messageHandlers: Set<MessageHandler> = new Set();
-  private myUserId: string = '';
-  private myDisplayName: string = '';
-  private isInitialized = false;
-  private scanTimer?: ReturnType<typeof setInterval>;
-  private messageQueue: Map<string, BLEMessage> = new Map();
+// ─── Класс ───────────────────────────────────────────────────────────────
 
-  async initialize(userId: string, displayName: string): Promise<boolean> {
-    // Защита от повторной инициализации
+class BLEMeshTransport {
+  private peers: Map<string, BLEPeer> = new Map(); // mac → peer
+  private userIdToMac: Map<string, string> = new Map(); // userId → mac
+  private messageHandlers: Set<MessageHandler> = new Set();
+  private myUserId = '';
+  private isInitialized = false;
+  private seenMessageIds: Set<string> = new Set();
+  private messageQueue: Map<string, BLEMessage> = new Map();
+  private listeners: Array<{ remove: () => void }> = [];
+  private scanRestartTimer?: ReturnType<typeof setInterval>;
+
+  async initialize(userId: string, _displayName: string): Promise<boolean> {
     if (this.isInitialized) return true;
-    if (Platform.OS === 'web') return false;
+    if (Platform.OS !== 'android' || !XAMTONBle || !bleEmitter) {
+      console.warn('[BLE] Not available on this platform');
+      return false;
+    }
 
     this.myUserId = userId;
-    this.myDisplayName = displayName;
 
     try {
-      const granted = await this.requestPermissions();
-      if (!granted) {
-        console.warn('[BLE] Permissions denied');
-        return false;
-      }
+      await XAMTONBle.initialize(userId);
+      this.setupEventListeners();
+      await XAMTONBle.startAdvertising(userId);
+      await XAMTONBle.startScanning();
 
-      const { BleManager } = require('react-native-ble-plx');
-      this.manager = new BleManager();
-
-      const state = await this.waitForBLEReady();
-      if (state !== 'PoweredOn') {
-        console.warn('[BLE] Not powered on:', state);
-        return false;
-      }
+      // Периодический рестарт сканирования (Android убивает скан через ~30 мин)
+      this.scanRestartTimer = setInterval(async () => {
+        try {
+          await XAMTONBle.stopScanning();
+          await XAMTONBle.startScanning();
+          this.cleanupStalePeers();
+        } catch (err) {
+          console.warn('[BLE] Scan restart error:', err);
+        }
+      }, 5 * 60 * 1000); // каждые 5 минут
 
       this.isInitialized = true;
-      console.log('[BLE] Initialized OK');
+      console.log('[BLE] Mesh transport initialized');
       return true;
     } catch (err) {
       console.warn('[BLE] Init error:', err);
@@ -79,234 +89,172 @@ class BLETransport {
     }
   }
 
-  private async requestPermissions(): Promise<boolean> {
-    if (Platform.OS !== 'android') return true;
+  private setupEventListeners(): void {
+    if (!bleEmitter) return;
 
-    try {
-      const apiLevel = parseInt(Platform.Version as string, 10);
+    // Найдено новое устройство
+    this.listeners.push(
+      bleEmitter.addListener('onPeerDiscovered', (event: any) => {
+        console.log('[BLE] Peer discovered:', event.mac, 'userId:', event.userId);
+      })
+    );
 
-      if (apiLevel >= 31) {
-        const results = await PermissionsAndroid.requestMultiple([
-          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-          PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-        ]);
-        return Object.values(results).every(
-          r => r === PermissionsAndroid.RESULTS.GRANTED
-        );
-      } else {
-        const result = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-        );
-        return result === PermissionsAndroid.RESULTS.GRANTED;
-      }
-    } catch (err) {
-      return false;
-    }
-  }
+    // Устройство подключилось
+    this.listeners.push(
+      bleEmitter.addListener('onPeerConnected', (event: any) => {
+        const { mac, userId, role } = event;
+        console.log('[BLE] Peer connected:', mac, role, userId || '(awaiting handshake)');
 
-  private waitForBLEReady(): Promise<string> {
-    return new Promise((resolve) => {
-      if (!this.manager) return resolve('Unknown');
-      const sub = this.manager.onStateChange((state: string) => {
-        if (['PoweredOn', 'PoweredOff', 'Unauthorized'].includes(state)) {
-          sub.remove();
-          resolve(state);
+        if (userId) {
+          this.registerPeer(mac, userId, role);
         }
-      }, true);
-      setTimeout(() => resolve('Unknown'), 5000);
-    });
+      })
+    );
+
+    // Получили userId через handshake
+    this.listeners.push(
+      bleEmitter.addListener('onPeerIdentified', (event: any) => {
+        const { mac, userId } = event;
+        console.log('[BLE] Peer identified:', mac, '→', userId);
+        const existing = this.peers.get(mac);
+        this.registerPeer(mac, userId, existing?.role || 'peripheral');
+
+        // Отправляем pending сообщения этому peer'у
+        this.flushQueueForUser(userId);
+      })
+    );
+
+    // Устройство отключилось
+    this.listeners.push(
+      bleEmitter.addListener('onPeerDisconnected', (event: any) => {
+        const { mac, userId } = event;
+        console.log('[BLE] Peer disconnected:', mac, userId);
+        this.peers.delete(mac);
+        if (userId) this.userIdToMac.delete(userId);
+        this.updateTransportStore();
+      })
+    );
+
+    // Получено сообщение
+    this.listeners.push(
+      bleEmitter.addListener('onMessageReceived', (event: any) => {
+        const { userId, data } = event;
+        this.handleIncomingMessage(userId, data);
+      })
+    );
+
+    // Advertising events (для логов)
+    this.listeners.push(
+      bleEmitter.addListener('onAdvertisingStarted', () => {
+        console.log('[BLE] Advertising active');
+      })
+    );
+    this.listeners.push(
+      bleEmitter.addListener('onAdvertisingFailed', (event: any) => {
+        console.warn('[BLE] Advertising failed:', event.errorCode);
+      })
+    );
   }
 
-  async startScanning(): Promise<void> {
-    // Главная защита — не запускаем если уже идёт сканирование
-    if (!this.isInitialized || this.isScanning || this.scanScheduled) return;
+  private registerPeer(mac: string, userId: string, role: string): void {
+    if (userId === this.myUserId) return;
 
-    this.isScanning = true;
-    this.scanScheduled = false;
-    console.log('[BLE] Scan started');
-
-    try {
-      this.manager.startDeviceScan(
-        null,
-        { allowDuplicates: false },
-        async (error: any, device: any) => {
-          if (error) {
-            console.warn('[BLE] Scan error:', error.message);
-            this.isScanning = false;
-            return;
-          }
-          if (device?.name?.startsWith('XAMT:')) {
-            await this.handleDiscoveredDevice(device);
-          }
-        }
-      );
-
-      // Останавливаем и перезапускаем через 30 сек — только если уже не запланировано
-      if (!this.scanTimer) {
-        this.scanTimer = setInterval(() => {
-          if (this.isScanning) {
-            this.manager?.stopDeviceScan();
-            this.isScanning = false;
-          }
-          this.cleanupStalePeers();
-          // Небольшая задержка перед следующим сканом
-          setTimeout(() => {
-            if (this.isInitialized && !this.isScanning) {
-              this.startScanning();
-            }
-          }, 1000);
-        }, SCAN_INTERVAL_MS);
-      }
-
-    } catch (err) {
-      console.warn('[BLE] Start scan error:', err);
-      this.isScanning = false;
-    }
-  }
-
-  private async handleDiscoveredDevice(device: any): Promise<void> {
-    const nameParts = (device.name || '').split(':');
-    if (nameParts.length < 2) return;
-
-    const peerUserId = nameParts[1];
-    const peerName = nameParts[2] || peerUserId.slice(0, 8);
-
-    if (peerUserId === this.myUserId) return;
-
-    const existing = this.peers.get(peerUserId);
     const peer: BLEPeer = {
-      id: device.id,
-      userId: peerUserId,
-      name: peerName,
-      rssi: device.rssi || -100,
+      mac,
+      userId,
+      role: role as 'central' | 'peripheral',
       lastSeen: Date.now(),
     };
-
-    this.peers.set(peerUserId, peer);
-
-    if (!existing) {
-      console.log('[BLE] New peer found:', peerName, peerUserId.slice(0, 8));
-      this.updateTransportStore();
-      await this.connectToPeer(device, peer);
-    }
+    this.peers.set(mac, peer);
+    this.userIdToMac.set(userId, mac);
+    this.updateTransportStore();
   }
 
-  private async connectToPeer(device: any, peer: BLEPeer): Promise<void> {
-    if (this.connectedDevices.has(peer.userId)) return;
+  // ─── Обработка входящих сообщений ──────────────────────────────────────
 
+  private handleIncomingMessage(fromUserId: string, rawData: string): void {
     try {
-      console.log('[BLE] Connecting to', peer.name);
-      const connected = await device.connect({ timeout: 10000 });
-      await connected.discoverAllServicesAndCharacteristics();
-      this.connectedDevices.set(peer.userId, connected);
+      const message: BLEMessage = JSON.parse(rawData);
 
-      connected.monitorCharacteristicForService(
-        XAMTON_SERVICE_UUID,
-        XAMTON_TX_CHAR_UUID,
-        (error: any, characteristic: any) => {
-          if (error || !characteristic?.value) return;
-          this.handleIncomingBLEData(characteristic.value, peer.userId);
-        }
-      );
+      // Дедупликация
+      if (this.seenMessageIds.has(message.id)) return;
+      this.seenMessageIds.add(message.id);
 
-      // Отправляем pending сообщения
-      for (const [id, msg] of this.messageQueue) {
-        if (msg.recipientId === peer.userId) {
-          await this.writeToDevice(connected, msg);
-          this.messageQueue.delete(id);
-        }
+      // Ограничиваем размер кэша
+      if (this.seenMessageIds.size > 1000) {
+        const arr = Array.from(this.seenMessageIds);
+        this.seenMessageIds = new Set(arr.slice(-500));
       }
 
-      connected.onDisconnected(() => {
-        console.log('[BLE] Peer disconnected:', peer.name);
-        this.connectedDevices.delete(peer.userId);
-        this.peers.delete(peer.userId);
-        this.updateTransportStore();
-      });
-
-    } catch (err) {
-      console.warn('[BLE] Connect error:', err);
-    }
-  }
-
-  private handleIncomingBLEData(base64Data: string, fromUserId: string): void {
-    try {
-      const { decodeBase64 } = require('tweetnacl-util');
-      const bytes = decodeBase64(base64Data);
-      const json = new TextDecoder().decode(bytes);
-      const message: BLEMessage = JSON.parse(json);
-
+      // Для нас?
       if (message.recipientId === this.myUserId) {
+        console.log('[BLE] Message for me from:', message.senderId);
         this.messageHandlers.forEach(h => h(message));
         return;
       }
 
-      // Relay mesh
-      if (message.ttl > 0 && !message.relayed) {
-        this.sendMessage({ ...message, ttl: message.ttl - 1, relayed: true });
+      // Mesh relay — пересылаем если TTL > 0
+      if (message.ttl > 0) {
+        console.log('[BLE] Relaying message, TTL:', message.ttl);
+        this.sendMessage({
+          ...message,
+          ttl: message.ttl - 1,
+          relayed: true,
+        }).catch(() => {});
       }
     } catch (err) {
-      console.warn('[BLE] Parse incoming error:', err);
+      console.warn('[BLE] Parse error:', err);
     }
   }
+
+  // ─── Отправка сообщений ────────────────────────────────────────────────
 
   async sendMessage(message: BLEMessage): Promise<boolean> {
-    const device = this.connectedDevices.get(message.recipientId);
+    if (!this.isInitialized) return false;
 
-    if (!device) {
-      this.messageQueue.set(message.id, message);
-      // Пробуем relay через любой подключённый peer
-      for (const [, dev] of this.connectedDevices) {
-        try {
-          await this.writeToDevice(dev, message);
+    const targetMac = this.userIdToMac.get(message.recipientId);
+
+    // Прямая отправка если peer подключён
+    if (targetMac) {
+      try {
+        const data = JSON.stringify(message);
+        await XAMTONBle.sendMessage(targetMac, data);
+        console.log('[BLE] Sent directly to:', message.recipientId.slice(0, 8));
+        return true;
+      } catch (err) {
+        console.warn('[BLE] Direct send failed:', err);
+      }
+    }
+
+    // Mesh relay — отправляем всем подключённым peer'ам
+    if (message.ttl > 0 && this.peers.size > 0) {
+      try {
+        const data = JSON.stringify(message);
+        const sent = await XAMTONBle.sendToAll(data);
+        if (sent > 0) {
+          console.log('[BLE] Relayed to', sent, 'peers');
           return true;
-        } catch {}
-      }
-      return false;
-    }
-
-    try {
-      await this.writeToDevice(device, message);
-      return true;
-    } catch (err) {
-      console.warn('[BLE] Send error:', err);
-      return false;
-    }
-  }
-
-  private async writeToDevice(device: any, message: BLEMessage): Promise<void> {
-    const { encodeBase64 } = require('tweetnacl-util');
-    const json = JSON.stringify(message);
-    const bytes = new TextEncoder().encode(json);
-
-    for (let i = 0; i < bytes.length; i += BLE_CHUNK_SIZE) {
-      const chunk = bytes.slice(i, i + BLE_CHUNK_SIZE);
-      const b64 = encodeBase64(chunk);
-      await device.writeCharacteristicWithResponseForService(
-        XAMTON_SERVICE_UUID,
-        XAMTON_RX_CHAR_UUID,
-        b64
-      );
-    }
-  }
-
-  private cleanupStalePeers(): void {
-    const now = Date.now();
-    for (const [userId, peer] of this.peers) {
-      if (now - peer.lastSeen > 60000) {
-        this.peers.delete(userId);
-        this.connectedDevices.delete(userId);
+        }
+      } catch (err) {
+        console.warn('[BLE] Relay failed:', err);
       }
     }
-    this.updateTransportStore();
+
+    // В очередь — отправим когда peer подключится
+    this.messageQueue.set(message.id, message);
+    return false;
   }
 
-  private updateTransportStore(): void {
-    const count = this.peers.size;
-    useTransportStore.getState().setTransportConnected('mesh_ble', count > 0, count);
+  private async flushQueueForUser(userId: string): Promise<void> {
+    for (const [id, msg] of this.messageQueue) {
+      if (msg.recipientId === userId) {
+        const sent = await this.sendMessage(msg);
+        if (sent) this.messageQueue.delete(id);
+      }
+    }
   }
+
+  // ─── Публичный API ─────────────────────────────────────────────────────
 
   onMessage(handler: MessageHandler): () => void {
     this.messageHandlers.add(handler);
@@ -317,35 +265,58 @@ class BLETransport {
     return Array.from(this.peers.values());
   }
 
+  getPeerByUserId(userId: string): BLEPeer | undefined {
+    const mac = this.userIdToMac.get(userId);
+    return mac ? this.peers.get(mac) : undefined;
+  }
+
   isReady(): boolean {
     return this.isInitialized;
   }
 
-  /**
-   * Имя устройства для обнаружения другими XAMTON устройствами
-   * Формат: XAMT:{userId}:{displayName}
-   */
-  getAdvertisingName(): string {
-    const name = this.myDisplayName.slice(0, 8).replace(/[^a-zA-Z0-9]/g, '');
-    return `XAMT:${this.myUserId.slice(0, 8)}:${name || 'user'}`;
+  hasPeer(userId: string): boolean {
+    return this.userIdToMac.has(userId);
   }
 
-  destroy(): void {
-    clearInterval(this.scanTimer);
-    this.scanTimer = undefined;
-    this.manager?.stopDeviceScan();
-    for (const device of this.connectedDevices.values()) {
-      device.cancelConnection().catch(() => {});
+  // ─── Утилиты ──────────────────────────────────────────────────────────
+
+  private cleanupStalePeers(): void {
+    const now = Date.now();
+    const staleTimeout = 5 * 60 * 1000; // 5 минут
+
+    for (const [mac, peer] of this.peers) {
+      if (now - peer.lastSeen > staleTimeout) {
+        this.peers.delete(mac);
+        this.userIdToMac.delete(peer.userId);
+      }
     }
-    this.connectedDevices.clear();
+    this.updateTransportStore();
+  }
+
+  private updateTransportStore(): void {
+    const count = this.peers.size;
+    useTransportStore.getState().setTransportConnected('mesh_ble', count > 0, count);
+  }
+
+  async destroy(): Promise<void> {
+    clearInterval(this.scanRestartTimer);
+    this.listeners.forEach(l => l.remove());
+    this.listeners = [];
+
+    if (this.isInitialized) {
+      try { await XAMTONBle.stopScanning(); } catch {}
+      try { await XAMTONBle.stopAdvertising(); } catch {}
+      try { await XAMTONBle.disconnectAll(); } catch {}
+    }
+
     this.peers.clear();
-    this.manager?.destroy();
-    this.manager = null;
+    this.userIdToMac.clear();
+    this.messageQueue.clear();
+    this.messageHandlers.clear();
+    this.seenMessageIds.clear();
     this.isInitialized = false;
-    this.isScanning = false;
-    this.scanScheduled = false;
     useTransportStore.getState().setTransportConnected('mesh_ble', false);
   }
 }
 
-export const bleTransport = new BLETransport();
+export const bleTransport = new BLEMeshTransport();
