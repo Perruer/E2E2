@@ -123,14 +123,20 @@ class DNSTunnelTransport {
     
     for (let i = 0; i < DOH_PROVIDERS.length; i++) {
       try {
+        // Создаём AbortController для timeout (React Native совместимый)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
         // Пробуем запросить A запись для проверки работоспособности
         const res = await fetch(
           `${DOH_PROVIDERS[i]}?name=${testDomains[i % testDomains.length]}&type=A`,
           {
             headers: { Accept: 'application/dns-json' },
-            signal: AbortSignal.timeout(5000),
+            signal: controller.signal,
           }
         );
+        
+        clearTimeout(timeoutId);
         
         if (res.ok) {
           const data = await res.json();
@@ -141,8 +147,8 @@ class DNSTunnelTransport {
             return true;
           }
         }
-      } catch (err) {
-        console.log(`[DNS] DoH provider ${DOH_PROVIDERS[i]} failed:`, err);
+      } catch (err: any) {
+        console.log(`[DNS] DoH provider ${DOH_PROVIDERS[i]} failed:`, err.message || err);
       }
     }
     return false;

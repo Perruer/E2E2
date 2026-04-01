@@ -69,20 +69,24 @@ class MessagePipeline {
         try {
           console.log('[Pipeline] WS connected');
           this.reconnectDelay = 2000;
-          // Legacy auth — сервер примет пустую подпись
-          this.ws?.send(JSON.stringify({ type: 'auth_response', signature: '' }));
-          useTransportStore.getState().setTransportConnected('internet', true);
-          this.fetchOfflineMessages().catch(err => console.warn('[Pipeline] Fetch offline messages error:', err));
+          
+          // Проверяем что WebSocket действительно открыт перед отправкой
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            // Legacy auth — сервер примет пустую подпись
+            this.ws.send(JSON.stringify({ type: 'auth_response', signature: '' }));
+            useTransportStore.getState().setTransportConnected('internet', true);
+            this.fetchOfflineMessages().catch(err => console.warn('[Pipeline] Fetch offline messages error:', err));
 
-          this.pingTimer = setInterval(() => {
-            try {
-              if (this.ws?.readyState === WebSocket.OPEN) {
-                this.ws.send(JSON.stringify({ type: 'ping' }));
+            this.pingTimer = setInterval(() => {
+              try {
+                if (this.ws?.readyState === WebSocket.OPEN) {
+                  this.ws.send(JSON.stringify({ type: 'ping' }));
+                }
+              } catch (err) {
+                console.warn('[Pipeline] Ping error:', err);
               }
-            } catch (err) {
-              console.warn('[Pipeline] Ping error:', err);
-            }
-          }, 25000);
+            }, 25000);
+          }
         } catch (err) {
           console.error('[Pipeline] WS onopen error:', err);
         }
