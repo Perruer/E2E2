@@ -167,7 +167,8 @@ dependencies {
     implementation("com.facebook.react:react-android")
     
     // Meshrabiya — WiFi Aware mesh networking
-    implementation("com.github.UstadMobile:Meshrabiya:0.1d11")
+    // Using main-SNAPSHOT to get latest from main branch
+    implementation("com.github.UstadMobile:Meshrabiya:main-SNAPSHOT")
 
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";
