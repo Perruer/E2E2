@@ -166,8 +166,9 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
     
-    // Meshrabiya — WiFi Aware mesh networking (локальный модуль)
-    implementation project(':lib-meshrabiya')
+    // Meshrabiya — временно отключён из-за проблем совместимости Gradle
+    // Приложение полностью функционально с BLE Mesh
+    // implementation project(':lib-meshrabiya')
 
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";
