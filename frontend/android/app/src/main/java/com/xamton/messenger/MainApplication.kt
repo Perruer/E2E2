@@ -25,6 +25,8 @@ class MainApplication : Application(), ReactApplication {
             PackageList(this).packages.apply {
               // Новый BLE модуль (заменяет старый XAMTONBluetoothPackage)
               add(XAMTONBlePackage())
+              // WiFi Aware Mesh модуль
+              add(XAMTONMeshPackage())
             }
 
           override fun getJSMainModuleName(): String = ".expo/.virtual-metro-entry"

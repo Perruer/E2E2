@@ -322,9 +322,21 @@ frontend:
         agent: "main"
         comment: "Colors, typography, spacing - light/dark themes"
 
+  - task: "WiFi Mesh (Meshrabiya) transport"
+    implemented: true
+    working: "NA"
+    file: "/app/frontend/src/core/network/MeshTransport.ts, /app/frontend/android/.../XAMTONMeshModule.kt"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Meshrabiya WiFi Aware mesh integrated. SUPER_NODE (Android 13+, WiFi Aware) acts as bridge between BLE and WiFi Mesh. LEAF_NODE (without WiFi Aware) uses BLE only, transparently bridged through Super Nodes. Routing table exchanges between Super Nodes for optimal path finding. Graceful degradation on devices without WiFi Aware."
+
 metadata:
   created_by: "main_agent"
-  version: "1.0"
+  version: "1.1"
   test_sequence: 1
   run_ui: false
 
@@ -332,6 +344,7 @@ test_plan:
   current_focus:
     - "Backend API endpoints testing"
     - "WebSocket P2P signaling"
+    - "WiFi Mesh (Meshrabiya) transport"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -341,3 +354,5 @@ agent_communication:
     message: "XAMTON MVP Phase 1 implemented. Crypto core with X3DH and Double Ratchet ready. UI is Telegram-like with transport indicators. Backend has P2P signaling via WebSocket and store-and-forward for offline messages."
   - agent: "testing"
     message: "✅ COMPREHENSIVE BACKEND TESTING COMPLETED: All 11 API endpoints tested and working correctly. All 4 WebSocket features tested and working. Fixed 2 critical serialization bugs (ObjectId and datetime). Backend fully functional with proper E2E encryption support, store-and-forward messaging, P2P signaling, and peer discovery. Ready for production use."
+  - agent: "main"
+    message: "✅ Meshrabiya WiFi Aware mesh network integration COMPLETED. New transport layer creates hybrid SUPER_NODE/LEAF_NODE mesh architecture. SUPER_NODEs (Android 13+ with WiFi Aware) automatically bridge BLE and WiFi Mesh. LEAF_NODEs (without WiFi Aware) transparently use BLE with automatic routing through Super Nodes. Routing tables exchanged between Super Nodes for intelligent path finding. Full graceful degradation on older devices. Transport priority: WS → WiFi Mesh → BLE → DNS → HTTP."

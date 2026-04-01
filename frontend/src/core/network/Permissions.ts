@@ -1,6 +1,6 @@
 /**
  * XAMTON Permissions Manager
- * Запрашивает все нужные разрешения для BLE и WiFi
+ * Запрашивает все нужные разрешения для BLE и WiFi (включая WiFi Aware для Meshrabiya)
  */
 import { Platform, PermissionsAndroid, Alert, Linking } from 'react-native';
 
@@ -8,18 +8,20 @@ export interface PermissionResult {
   bluetooth: boolean;
   location: boolean;
   wifi: boolean;
+  wifiAware: boolean;
 }
 
 export async function requestAllPermissions(): Promise<PermissionResult> {
   if (Platform.OS !== 'android') {
     // iOS — разрешения через Info.plist, спрашиваются автоматически
-    return { bluetooth: true, location: true, wifi: true };
+    return { bluetooth: true, location: true, wifi: true, wifiAware: false };
   }
 
   const result: PermissionResult = {
     bluetooth: false,
     location: false,
     wifi: true, // WiFi не требует явного разрешения
+    wifiAware: false,
   };
 
   try {
@@ -27,12 +29,19 @@ export async function requestAllPermissions(): Promise<PermissionResult> {
 
     if (androidVersion >= 31) {
       // Android 12+ — новые BLE разрешения
-      const blePermissions = await PermissionsAndroid.requestMultiple([
+      const permissions = [
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
         PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      ]);
+      ];
+
+      // Android 13+ — WiFi Aware разрешение
+      if (androidVersion >= 33) {
+        permissions.push(PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES);
+      }
+
+      const blePermissions = await PermissionsAndroid.requestMultiple(permissions);
 
       result.bluetooth =
         blePermissions[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] === 'granted' &&
@@ -41,6 +50,12 @@ export async function requestAllPermissions(): Promise<PermissionResult> {
 
       result.location =
         blePermissions[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === 'granted';
+
+      // WiFi Aware permission (Android 13+)
+      if (androidVersion >= 33 && PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES) {
+        result.wifiAware =
+          blePermissions[PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES] === 'granted';
+      }
 
     } else {
       // Android < 12 — старые разрешения
@@ -58,7 +73,7 @@ export async function requestAllPermissions(): Promise<PermissionResult> {
       result.location = locationPerm === 'granted';
     }
 
-    console.log('[Permissions] BLE:', result.bluetooth, 'Location:', result.location);
+    console.log('[Permissions] BLE:', result.bluetooth, 'Location:', result.location, 'WiFi Aware:', result.wifiAware);
     return result;
 
   } catch (err) {

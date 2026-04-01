@@ -268,13 +268,19 @@ class MessagePipeline {
       }
     } catch {}
 
-    // 3. WiFi Direct
+    // 3. WiFi Mesh (для SUPER_NODE)
     try {
-      const { wifiDirectTransport } = require('./WiFiDirectTransport');
-      if (wifiDirectTransport.isReady()) {
-        const sent = await wifiDirectTransport.sendMessage(recipientId, payload);
+      const { meshTransport } = require('./MeshTransport');
+      if (meshTransport.isReady()) {
+        const sent = await meshTransport.sendMessage({
+          id: messageId,
+          senderId: this.identity.userId,
+          recipientId,
+          payload,
+          timestamp: Date.now(),
+        });
         if (sent) {
-          console.log('[Pipeline] → WiFi Direct');
+          console.log('[Pipeline] → WiFi Mesh');
           this.setMessageStatus(chatId, messageId, 'sent');
           return;
         }
@@ -315,16 +321,19 @@ class MessagePipeline {
 
   private getBestTransport(recipientId: string): TransportType {
     if (this.ws?.readyState === WebSocket.OPEN) return 'internet';
+    
+    // WiFi Mesh (для SUPER_NODE) — приоритет над BLE
+    try {
+      const { meshTransport } = require('./MeshTransport');
+      if (meshTransport.isReady()) return 'mesh_wifi';
+    } catch {}
+    
     try {
       const { bleTransport } = require('./BLETransport');
       if (bleTransport.isReady() && bleTransport.hasPeer(recipientId))
         return 'mesh_ble';
     } catch {}
-    try {
-      const { wifiDirectTransport } = require('./WiFiDirectTransport');
-      if (wifiDirectTransport.isReady() && wifiDirectTransport.getPeers().some((p: any) => p.userId === recipientId))
-        return 'mesh_wifi';
-    } catch {}
+    
     try {
       const { dnsTunnel } = require('./DNSTunnel');
       if (dnsTunnel.isReady()) return 'dns';
@@ -361,23 +370,27 @@ class MessagePipeline {
       } catch (err) { console.warn('[Pipeline] BLE init failed:', err); }
     }
 
-    // WiFi Direct
+    // WiFi Mesh (Meshrabiya) — только для SUPER_NODE
+    // LEAF_NODE прозрачно использует BLE → Super Node → WiFi Mesh
     if (transportStore.transports.mesh_wifi.enabled) {
       try {
-        const { wifiDirectTransport } = require('./WiFiDirectTransport');
-        const ok = await wifiDirectTransport.initialize(userId, name);
+        const { meshTransport } = require('./MeshTransport');
+        const ok = await meshTransport.initialize(userId, name);
         if (ok) {
-          wifiDirectTransport.onMessage((senderId: string, payload: string) => {
+          meshTransport.onMessage((msg: any) => {
             this.deliverIncomingMessage({
-              sender_id: senderId,
-              payload,
+              id: msg.id,
+              sender_id: msg.senderId,
+              payload: msg.payload,
               timestamp: new Date().toISOString(),
               transport: 'mesh_wifi',
             });
           });
-          console.log('[Pipeline] WiFi Direct ready');
+          console.log('[Pipeline] WiFi Mesh ready (SUPER_NODE)');
+        } else {
+          console.log('[Pipeline] WiFi Mesh not available (LEAF_NODE or no WiFi Aware)');
         }
-      } catch (err) { console.warn('[Pipeline] WiFi Direct init failed:', err); }
+      } catch (err) { console.warn('[Pipeline] WiFi Mesh init failed:', err); }
     }
 
     // DNS Tunnel
@@ -423,7 +436,7 @@ class MessagePipeline {
     this.pendingAcks.clear();
 
     try { require('./BLETransport').bleTransport.destroy(); } catch {}
-    try { require('./WiFiDirectTransport').wifiDirectTransport.destroy(); } catch {}
+    try { require('./MeshTransport').meshTransport.destroy(); } catch {}
     try { require('./DNSTunnel').dnsTunnel.destroy(); } catch {}
   }
 }

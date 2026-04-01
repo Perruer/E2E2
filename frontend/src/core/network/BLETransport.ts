@@ -1,5 +1,5 @@
 /**
- * XAMTON BLE Mesh Transport v3
+ * XAMTON BLE Mesh Transport v4
  * Нативный модуль — без react-native-ble-plx и react-native-ble-advertiser
  * 
  * Архитектура:
@@ -8,11 +8,16 @@
  * - При обнаружении другого XAMTON устройства — автоматическое подключение
  * - Handshake для обмена userId
  * - Mesh relay: сообщения с TTL > 0 пересылаются через промежуточные устройства
+ * 
+ * v4 — интеграция с WiFi Mesh (Meshrabiya):
+ * - SUPER_NODE: BLE пиры автоматически регистрируются в mesh
+ * - BLE сообщения bridge-ятся в WiFi Mesh через MeshTransport
  */
 
 import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
 import { useTransportStore } from '../../store/useTransportStore';
 import { v4 as uuidv4 } from 'uuid';
+import { meshTransport } from './MeshTransport';
 
 const { XAMTONBle } = NativeModules;
 const bleEmitter = Platform.OS === 'android' && XAMTONBle
@@ -82,6 +87,10 @@ class BLEMeshTransport {
 
       this.isInitialized = true;
       console.log('[BLE] Mesh transport initialized');
+      
+      // Настраиваем bridge Mesh → BLE (для SUPER_NODE)
+      this.setupMeshBridge();
+      
       return true;
     } catch (err) {
       console.warn('[BLE] Init error:', err);
@@ -121,6 +130,9 @@ class BLEMeshTransport {
 
         // Отправляем pending сообщения этому peer'у
         this.flushQueueForUser(userId);
+        
+        // Регистрируем BLE пира в mesh (для SUPER_NODE)
+        meshTransport.registerBlePeer(userId).catch(() => {});
       })
     );
 
@@ -130,7 +142,11 @@ class BLEMeshTransport {
         const { mac, userId } = event;
         console.log('[BLE] Peer disconnected:', mac, userId);
         this.peers.delete(mac);
-        if (userId) this.userIdToMac.delete(userId);
+        if (userId) {
+          this.userIdToMac.delete(userId);
+          // Удаляем BLE пира из mesh (для SUPER_NODE)
+          meshTransport.unregisterBlePeer(userId).catch(() => {});
+        }
         this.updateTransportStore();
       })
     );
@@ -193,6 +209,10 @@ class BLEMeshTransport {
         return;
       }
 
+      // Bridge в WiFi Mesh (для SUPER_NODE)
+      // Сообщение от Leaf Node → пересылаем в WiFi Mesh
+      meshTransport.bridgeMessageToMesh(fromUserId, rawData).catch(() => {});
+
       // Mesh relay — пересылаем если TTL > 0
       if (message.ttl > 0) {
         console.log('[BLE] Relaying message, TTL:', message.ttl);
@@ -205,6 +225,24 @@ class BLEMeshTransport {
     } catch (err) {
       console.warn('[BLE] Parse error:', err);
     }
+  }
+
+  // ─── Mesh Bridge Setup ────────────────────────────────────────────────
+
+  private setupMeshBridge(): void {
+    // Устанавливаем callback для получения сообщений из Mesh для BLE пиров
+    meshTransport.setBridgeToBleHandler(async (targetUserId: string, messageJson: string) => {
+      // Mesh → BLE: отправляем сообщение BLE пиру
+      const targetMac = this.userIdToMac.get(targetUserId);
+      if (targetMac) {
+        try {
+          await XAMTONBle.sendMessage(targetMac, messageJson);
+          console.log('[BLE] Bridge from Mesh → BLE peer:', targetUserId.slice(0, 8));
+        } catch (err) {
+          console.warn('[BLE] Bridge Mesh→BLE error:', err);
+        }
+      }
+    });
   }
 
   // ─── Отправка сообщений ────────────────────────────────────────────────
