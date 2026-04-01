@@ -13,7 +13,7 @@ import base64
 import uuid
 
 # Backend URL from environment
-BACKEND_URL = "https://censorship-resistant.preview.emergentagent.com/api"
+BACKEND_URL = "https://project-next-19.preview.emergentagent.com/api"
 
 class XAMTONTester:
     def __init__(self):

@@ -13,7 +13,7 @@ from datetime import datetime
 
 # WebSocket URL for testing (using external URL)
 WS_URL = "wss://censorship-resistant.preview.emergentagent.com/api/ws"
-BACKEND_URL = "https://censorship-resistant.preview.emergentagent.com/api"
+BACKEND_URL = "https://project-next-19.preview.emergentagent.com/api"
 
 class WebSocketTester:
     def __init__(self):
