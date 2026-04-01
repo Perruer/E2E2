@@ -96,34 +96,54 @@ class DNSTunnelTransport {
   async initialize(userId: string): Promise<boolean> {
     this.myUserId = userId;
 
+    console.log('[DNS] Checking DoH availability...');
+    
     // Проверяем доступность DNS over HTTPS
     const available = await this.checkDOHAvailability();
     if (available) {
-      console.log('[DNS] DoH available, starting tunnel');
+      console.log('[DNS] ✓ DoH available, starting tunnel');
+      this.isRunning = true;
       useTransportStore.getState().setTransportConnected('dns', true);
       this.startPolling();
       return true;
     }
 
-    console.warn('[DNS] DoH not available');
+    console.warn('[DNS] ✗ DoH not available - all providers failed');
+    console.warn('[DNS] This is normal if:');
+    console.warn('[DNS]   - Network blocks DoH (corporate/school WiFi)');
+    console.warn('[DNS]   - Firewall restricts HTTPS DNS');
+    console.warn('[DNS]   - No internet connection');
+    console.warn('[DNS] App will work with other transports (WebSocket, BLE, WiFi Mesh)');
     return false;
   }
 
   private async checkDOHAvailability(): Promise<boolean> {
+    // Проверяем доступность DoH провайдеров с реальным DNS запросом
+    const testDomains = ['google.com', 'cloudflare.com', 'example.com'];
+    
     for (let i = 0; i < DOH_PROVIDERS.length; i++) {
       try {
+        // Пробуем запросить A запись для проверки работоспособности
         const res = await fetch(
-          `${DOH_PROVIDERS[i]}?name=xamton.net&type=TXT`,
+          `${DOH_PROVIDERS[i]}?name=${testDomains[i % testDomains.length]}&type=A`,
           {
             headers: { Accept: 'application/dns-json' },
-            signal: AbortSignal.timeout(3000),
+            signal: AbortSignal.timeout(5000),
           }
         );
+        
         if (res.ok) {
-          this.currentDOH = i;
-          return true;
+          const data = await res.json();
+          // Проверяем что получили валидный DNS ответ
+          if (data && (data.Answer || data.Status === 0)) {
+            this.currentDOH = i;
+            console.log(`[DNS] DoH provider available: ${DOH_PROVIDERS[i]}`);
+            return true;
+          }
         }
-      } catch {}
+      } catch (err) {
+        console.log(`[DNS] DoH provider ${DOH_PROVIDERS[i]} failed:`, err);
+      }
     }
     return false;
   }
