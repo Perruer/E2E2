@@ -12,5 +12,8 @@ local.properties
 *.hprof
 .cxx/
 
+# Meshrabiya — локальный модуль (клонирован из GitHub)
+meshrabiya-lib/
+
 # Bundle artifacts
 *.jsbundle

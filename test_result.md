@@ -325,14 +325,14 @@ frontend:
   - task: "WiFi Mesh (Meshrabiya) transport"
     implemented: true
     working: "NA"
-    file: "/app/frontend/src/core/network/MeshTransport.ts, /app/frontend/android/.../XAMTONMeshModule.kt"
+    file: "/app/frontend/src/core/network/MeshTransport.ts, /app/frontend/android/.../XAMTONMeshModule.kt, /app/frontend/android/meshrabiya-lib"
     stuck_count: 0
     priority: "high"
     needs_retesting: true
     status_history:
       - working: "NA"
         agent: "main"
-        comment: "Meshrabiya WiFi Aware mesh integrated. SUPER_NODE (Android 13+, WiFi Aware) acts as bridge between BLE and WiFi Mesh. LEAF_NODE (without WiFi Aware) uses BLE only, transparently bridged through Super Nodes. Routing table exchanges between Super Nodes for optimal path finding. Graceful degradation on devices without WiFi Aware."
+        comment: "Meshrabiya WiFi Aware mesh integrated as LOCAL MODULE. Исходники клонированы в android/meshrabiya-lib/ и подключены как Gradle модуль. Решает проблемы с JitPack — 100% надёжная сборка. SUPER_NODE (Android 13+, WiFi Aware) acts as bridge between BLE and WiFi Mesh. LEAF_NODE (without WiFi Aware) uses BLE only, transparently bridged through Super Nodes. Routing table exchanges between Super Nodes for optimal path finding. Graceful degradation on devices without WiFi Aware."
 
 metadata:
   created_by: "main_agent"

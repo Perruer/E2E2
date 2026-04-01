@@ -36,4 +36,8 @@ rootProject.name = 'XAMTON'
 expoAutolinking.useExpoVersionCatalog()
 
 include ':app'
+// Meshrabiya — локальный модуль для WiFi Aware mesh
+include ':lib-meshrabiya'
+project(':lib-meshrabiya').projectDir = new File(rootProject.projectDir, 'meshrabiya-lib/lib-meshrabiya')
+
 includeBuild(expoAutolinking.reactNativeGradlePlugin)
