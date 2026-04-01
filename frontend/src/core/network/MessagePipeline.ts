@@ -66,18 +66,26 @@ class MessagePipeline {
       this.ws = new WebSocket(`${WS_URL}/api/ws/${this.identity.userId}`);
 
       this.ws.onopen = () => {
-        console.log('[Pipeline] WS connected');
-        this.reconnectDelay = 2000;
-        // Legacy auth — сервер примет пустую подпись
-        this.ws?.send(JSON.stringify({ type: 'auth_response', signature: '' }));
-        useTransportStore.getState().setTransportConnected('internet', true);
-        this.fetchOfflineMessages();
+        try {
+          console.log('[Pipeline] WS connected');
+          this.reconnectDelay = 2000;
+          // Legacy auth — сервер примет пустую подпись
+          this.ws?.send(JSON.stringify({ type: 'auth_response', signature: '' }));
+          useTransportStore.getState().setTransportConnected('internet', true);
+          this.fetchOfflineMessages().catch(err => console.warn('[Pipeline] Fetch offline messages error:', err));
 
-        this.pingTimer = setInterval(() => {
-          if (this.ws?.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({ type: 'ping' }));
-          }
-        }, 25000);
+          this.pingTimer = setInterval(() => {
+            try {
+              if (this.ws?.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({ type: 'ping' }));
+              }
+            } catch (err) {
+              console.warn('[Pipeline] Ping error:', err);
+            }
+          }, 25000);
+        } catch (err) {
+          console.error('[Pipeline] WS onopen error:', err);
+        }
       };
 
       this.ws.onmessage = (event) => {
